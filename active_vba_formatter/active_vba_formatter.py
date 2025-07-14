@@ -1,9 +1,11 @@
 # active_vba_formatter.py
 # v1.0.0 公開
 # v1.0.1 二重起動チェック機能
+# v1.0.2 公開開始
+# v1.0.3 エクセル監視機能を堅牢に。フォーマットした後に1行目に戻るのを修正
 # ===================================================================================
 #
-# Version: 1.0.2 (内部バージョン)
+# Version: 1.0.3
 #
 # 概要:
 #   バックグラウンドで常駐し、アクティブなExcelブックのVBAコードを
@@ -152,98 +154,110 @@ class VbaFormatter:
 
 def monitoring_loop(icon):
     """バックグラウンドでExcelの動作を監視し、コード整形を実行するメインスレッド。"""
-    #print("[DEBUG] monitoring_loop started") # ★追加
     log_queue.put(messages.monitoring_started())
     formatter = VbaFormatter()
     target_app = target_hwnd = target_filepath = None
     last_modified_time = 0
     was_window_visible = is_any_excel_window_visible()
     last_status_message = ""
+    
     pythoncom.CoInitialize()
-
-    loop_count = 0 # ★追加
     while not stop_event.is_set():
-        loop_count += 1 # ★追加
-        #print(f"\n--- Loop {loop_count} ---") # ★追加
-
         current_status_message = ""
-        
-        # 1. Excel情報取得
-        #print("[DEBUG] Calling get_active_excel_info...") # ★追加
-        active_app, active_hwnd, active_filepath = get_active_excel_info()
-        #print(f"[DEBUG] get_active_excel_info returned: app={active_app is not None}, hwnd={active_hwnd}, path={active_filepath}") # ★追加
 
-        # 2. 監視対象切り替え
-        if active_app and active_hwnd != target_hwnd:
-            #print(f"[DEBUG] Switching target to {os.path.basename(active_filepath)}") # ★追加
-            log_queue.put(messages.target_switched(os.path.basename(active_filepath)))
-            # (以下略)
-            target_app, target_hwnd, target_filepath = active_app, active_hwnd, active_filepath
-            if os.path.exists(target_filepath): last_modified_time = os.path.getmtime(target_filepath)
-            last_status_message = ""
-
-        # 3. 監視対象の有効性チェック
-        is_target_valid = False
-        if target_app and target_hwnd and win32gui.IsWindow(target_hwnd):
-            try:
-                _ = target_app.Name; is_target_valid = True
-            except com_error as e: # ★エラー内容の表示
-                #print(f"[DEBUG] target_app.Name check failed: {e}")
-                is_target_valid = False
-        #print(f"[DEBUG] Target valid: {is_target_valid}") # ★追加
-
-        if not is_target_valid and target_app:
-            #print(f"[DEBUG] Target became invalid. Resetting.") # ★追加
-            log_queue.put(messages.monitoring_interrupted(os.path.basename(target_filepath)))
-            target_app = target_hwnd = target_filepath = None; last_status_message = ""
-
-        # 4. メイン処理
-        if target_app:
-            #print("[DEBUG] Target exists. Entering main processing block.") # ★追加
-            try:
-                vbe_visible = target_app.VBE.MainWindow.Visible
-                #print(f"[DEBUG] VBE visibility: {vbe_visible}") # ★追加
-                if vbe_visible:
-                    # (以下略)
-                    current_modified_time = os.path.getmtime(target_filepath)
-                    if current_modified_time > last_modified_time:
-                        log_queue.put(messages.formatting_detected(os.path.basename(target_filepath)))
-                        last_modified_time = current_modified_time
-                        vbe = target_app.VBE
-                        for component in vbe.ActiveVBProject.VBComponents:
-                            if component.CodeModule.CountOfLines > 0:
-                                original_code = component.CodeModule.Lines(1, component.CodeModule.CountOfLines); formatted_code = formatter.format_code(original_code)
-                                if original_code != formatted_code:
-                                    component.CodeModule.DeleteLines(1, component.CodeModule.CountOfLines); component.CodeModule.AddFromString(formatted_code)
-                        log_queue.put(messages.formatting_complete())
-                        last_status_message = ""
-                    current_status_message = messages.monitoring_vbe(os.path.basename(target_filepath))
-                else: current_status_message = messages.waiting_for_vbe(os.path.basename(target_filepath))
-            except Exception as e:
-                #print(f"[DEBUG] Main processing block error: {e}") # ★エラー内容の表示
-                log_queue.put(messages.connection_lost(os.path.basename(target_filepath)))
-                target_app = target_hwnd = target_filepath = None; last_status_message = ""
-        else: # 5. 待機処理
-            #print("[DEBUG] No target. Checking window visibility.") # ★追加
-            is_visible = is_any_excel_window_visible()
-            #print(f"[DEBUG] is_any_excel_window_visible: {is_visible}") # ★追加
-            if is_visible: current_status_message = messages.searching_for_book()
-            else: current_status_message = messages.waiting_for_excel()
-
-        # (以下、ループの残りは変更なし)
-        if current_status_message and current_status_message != last_status_message:
-            log_queue.put(current_status_message); last_status_message = current_status_message
+        # ステップ1: まず、ユーザーが操作可能なExcelウィンドウが存在するかを判断する
         is_visible_now = is_any_excel_window_visible()
-        #print(f"[DEBUG] Exit Check: was_visible={was_window_visible}, is_now_visible={is_visible_now}")
+
+        # ステップ2: ウィンドウが存在する場合のみ、アクティブなExcelの情報を取得しようと試みる
+        if is_visible_now:
+            active_app, active_hwnd, active_filepath = get_active_excel_info()
+
+            # ステップ2a: 新しいターゲットを捕捉した場合
+            if active_app and active_hwnd != target_hwnd:
+                log_queue.put(messages.target_switched(os.path.basename(active_filepath)))
+                target_app, target_hwnd, target_filepath = active_app, active_hwnd, active_filepath
+                if os.path.exists(target_filepath):
+                    last_modified_time = os.path.getmtime(target_filepath)
+                last_status_message = ""
+
+            # ステップ2b: 既存のターゲットが無効になったかチェック
+            is_target_valid = False
+            if target_app:
+                try:
+                    _ = target_app.Name; is_target_valid = True
+                except com_error:
+                    is_target_valid = False
+            
+            if not is_target_valid and target_app:
+                log_queue.put(messages.monitoring_interrupted(os.path.basename(target_filepath)))
+                target_app = target_hwnd = target_filepath = None; last_status_message = ""
+
+            # ステップ3: 有効なターゲットに対してフォーマット処理を実行
+            if target_app:
+                try:
+                    if target_app.VBE.MainWindow.Visible:
+                        current_modified_time = os.path.getmtime(target_filepath)
+                        if current_modified_time > last_modified_time:
+                            log_queue.put(messages.formatting_detected(os.path.basename(target_filepath)))
+                            last_modified_time = current_modified_time
+                            vbe = target_app.VBE
+                            for component in vbe.ActiveVBProject.VBComponents:
+                                if component.CodeModule.CountOfLines > 0:
+                                    code_pane = component.CodeModule.CodePane
+                                    try:
+                                        original_line = code_pane.GetSelection(1, 1, 1, 80)[0]
+                                        top_line = code_pane.TopLine
+                                    except com_error:
+                                        original_line = 1; top_line = 1
+                                    original_code = component.CodeModule.Lines(1, component.CodeModule.CountOfLines)
+                                    formatted_code = formatter.format_code(original_code)
+                                    if original_code != formatted_code:
+                                        component.CodeModule.DeleteLines(1, component.CodeModule.CountOfLines)
+                                        component.CodeModule.AddFromString(formatted_code)
+                                        try:
+                                            code_pane.TopLine = top_line
+                                            code_pane.SetSelection(original_line, 1, original_line, 1)
+                                        except com_error:
+                                            pass
+                            log_queue.put(messages.formatting_complete())
+                            last_status_message = ""
+                        current_status_message = messages.monitoring_vbe(os.path.basename(target_filepath))
+                    else:
+                        current_status_message = messages.waiting_for_vbe(os.path.basename(target_filepath))
+                except com_error:
+                    log_queue.put(messages.connection_lost(os.path.basename(target_filepath)))
+                    target_app = target_hwnd = target_filepath = None
+                    last_status_message = ""
+            else:
+                current_status_message = messages.searching_for_book()
+
+        # ステップ4: ウィンドウが存在しない場合の処理
+        else:
+            current_status_message = messages.waiting_for_excel()
+            if target_app:
+                log_queue.put(messages.monitoring_interrupted(os.path.basename(target_filepath)))
+                target_app = target_hwnd = target_filepath = None
+                last_status_message = ""
+
+        # ステップ5: 終了判定
         if was_window_visible and not is_visible_now:
             if ask_to_exit():
-                log_queue.put(messages.exiting_by_dialog()); stop_event.set(); icon.menu.items[0](icon); break
-        was_window_visible = is_visible_now
-        time.sleep(1) # ★デバッグ中は sleep を 2 or 3 に伸ばすと追いやすいです
+                log_queue.put(messages.exiting_by_dialog())
+                stop_event.set()
+                break
 
-    #print("[DEBUG] monitoring_loop finished") # ★追加
+        # ステップ6: ツールチップと状態の更新
+        if current_status_message and current_status_message != last_status_message:
+            log_queue.put(current_status_message)
+            last_status_message = current_status_message
+        
+        was_window_visible = is_visible_now
+        time.sleep(1)
+
     pythoncom.CoUninitialize()
     log_queue.put(messages.monitoring_stopped())
+
+
 
 
 
@@ -287,35 +301,34 @@ def get_active_excel_info():
     ウィンドウハンドルとCOMオブジェクトを別々に取得し、それらが一致するかを検証する。
     """
     try:
-        # ステップ1: まず、フォアグラウンドのウィンドウハンドルを取得する
+        # ステップ1: フォアグラウンドのウィンドウハンドルがExcelか確認
         fg_hwnd = win32gui.GetForegroundWindow()
-        if not fg_hwnd:
+        if not fg_hwnd or win32gui.GetClassName(fg_hwnd) not in ('XLMAIN', 'EXCEL7'):
             return None, None, None
 
-        # ステップ2: そのウィンドウがExcel（クラス名 'XLMAIN'）であるかを確認する
-        if win32gui.GetClassName(fg_hwnd) != 'XLMAIN':
-            return None, None, None
-
-        # ステップ3: COMテーブルからアクティブなExcelオブジェクトを取得する
-        # この時点では、これがフォアグラウンドのものかはまだ不明
+        # ステップ2: COMテーブルからアクティブなExcelオブジェクトを取得
         app = win32com.client.GetActiveObject("Excel.Application")
-        if not (app and app.ActiveWorkbook and app.ActiveWorkbook.FullName):
+        
+        # ステップ3: アクティブなワークブックが存在するかを安全にチェック
+        # getattrを使い、プロパティが存在しない場合はNoneを返すようにする
+        active_wb = getattr(app, 'ActiveWorkbook', None)
+        if not active_wb:
             return None, None, None
 
-        # ステップ4: 2つの情報が同じものを指しているか検証する
-        # appオブジェクトのファイル名が、フォアグラウンドウィンドウのタイトルに含まれていればOK
-        app_path = app.ActiveWorkbook.FullName
-        window_title = win32gui.GetWindowText(fg_hwnd)
+        # ステップ4: ワークブックのフルパスが取得できるかチェック
+        app_path = getattr(active_wb, 'FullName', None)
+        if not app_path:
+            return None, None, None
 
+        # ステップ5: ウィンドウハンドルとCOMオブジェクトが一致するかを検証
+        window_title = win32gui.GetWindowText(fg_hwnd)
         if os.path.basename(app_path) in window_title:
-            # 検証成功。フォアグラウンドのExcelを正しく捕捉できた
             return app, fg_hwnd, app_path
         else:
-            # GetActiveObjectが別の（バックグラウンドの）Excelを掴んだ可能性がある
             return None, None, None
 
-    except (com_error, pywintypes.error):
-        # COM関連のエラーは、Excelが対象でない場合などに正常に発生しうる
+    except (com_error, pywintypes.error, AttributeError):
+        # [修正] AttributeErrorも捕捉対象に加え、より安全にする
         return None, None, None
 
 
@@ -325,11 +338,20 @@ def is_any_excel_window_visible():
     found = False
     def enum_proc(hwnd, lParam):
         nonlocal found
-        if win32gui.IsWindowVisible(hwnd) and win32gui.GetClassName(hwnd) in ('XLMAIN', 'EXCEL7'):
-            found = True; return False
+        # [修正] ウィンドウが可視であり、かつ、ウィンドウタイトルが空でないことを条件に加える
+        if (win32gui.IsWindowVisible(hwnd) and 
+            win32gui.GetWindowText(hwnd) != "" and 
+            win32gui.GetClassName(hwnd) in ('XLMAIN', 'EXCEL7')):
+            
+            found = True
+            return False # 1つ見つかったので列挙を停止
         return True
-    try: win32gui.EnumWindows(enum_proc, None)
-    except pywintypes.error: pass
+        
+    try:
+        win32gui.EnumWindows(enum_proc, None)
+    except pywintypes.error:
+        pass # APIエラーは無視
+        
     return found
 
 # ===================================================================================
@@ -466,3 +488,134 @@ if __name__ == "__main__":
     except (com_error, pywintypes.error) as e:
         print(f"get_active_excel_info Error: {e}") # ← この行を追加
     return None, None, None'''
+
+'''def monitoring_loop(icon):
+    """バックグラウンドでExcelの動作を監視し、コード整形を実行するメインスレッド。"""
+    #print("[DEBUG] monitoring_loop started") # ★追加
+    log_queue.put(messages.monitoring_started())
+    formatter = VbaFormatter()
+    target_app = target_hwnd = target_filepath = None
+    last_modified_time = 0
+    was_window_visible = is_any_excel_window_visible()
+    last_status_message = ""
+    pythoncom.CoInitialize()
+
+    loop_count = 0 # ★追加
+    while not stop_event.is_set():
+        loop_count += 1 # ★追加
+        #print(f"\n--- Loop {loop_count} ---") # ★追加
+
+        current_status_message = ""
+        
+        # 1. Excel情報取得
+        #print("[DEBUG] Calling get_active_excel_info...") # ★追加
+        active_app, active_hwnd, active_filepath = get_active_excel_info()
+        #print(f"[DEBUG] get_active_excel_info returned: app={active_app is not None}, hwnd={active_hwnd}, path={active_filepath}") # ★追加
+
+        # 2. 監視対象切り替え
+        if active_app and active_hwnd != target_hwnd:
+            #print(f"[DEBUG] Switching target to {os.path.basename(active_filepath)}") # ★追加
+            log_queue.put(messages.target_switched(os.path.basename(active_filepath)))
+            # (以下略)
+            target_app, target_hwnd, target_filepath = active_app, active_hwnd, active_filepath
+            if os.path.exists(target_filepath): last_modified_time = os.path.getmtime(target_filepath)
+            last_status_message = ""
+
+        # 3. 監視対象の有効性チェック
+        is_target_valid = False
+        if target_app and target_hwnd and win32gui.IsWindow(target_hwnd):
+            try:
+                _ = target_app.Name; is_target_valid = True
+            except com_error:
+                is_target_valid = False
+        
+        # --- ▼ ここから修正 ▼ ---
+        # ターゲットが無効になった場合（Excelが閉じられた、またはクラッシュした場合）
+        if not is_target_valid and target_app:
+            log_queue.put(messages.monitoring_interrupted(os.path.basename(target_filepath)))
+            
+            # [重要] 接続が切れた直後にウィンドウの存在を最終確認する
+            time.sleep(0.5) # OSの状態安定を待つ
+            if not is_any_excel_window_visible():
+                if ask_to_exit():
+                    log_queue.put(messages.exiting_by_dialog())
+                    stop_event.set()
+                    # メニューから終了を選択した場合と同じ動作をさせる
+                    # メインスレッドのiconオブジェクトに直接アクセスはできないため、
+                    # stop_eventをセットするに留めるのが安全
+                    break # 監視ループを抜ける
+
+            # ターゲット情報をリセット
+            target_app = target_hwnd = target_filepath = None; last_status_message = ""
+
+        # 4. メイン処理
+        if target_app:
+            try:
+                # --- ▼ tryブロックの範囲はここまで ▼ ---
+                vbe_visible = target_app.VBE.MainWindow.Visible
+                if vbe_visible:
+                    current_modified_time = os.path.getmtime(target_filepath)
+                    if current_modified_time > last_modified_time:
+                        log_queue.put(messages.formatting_detected(os.path.basename(target_filepath)))
+                        last_modified_time = current_modified_time
+                        
+                        vbe = target_app.VBE
+                        for component in vbe.ActiveVBProject.VBComponents:
+                            if component.CodeModule.CountOfLines > 0:
+                                code_pane = component.CodeModule.CodePane
+                                
+                                # 1. 現在の位置情報を記憶
+                                try:
+                                    original_line = code_pane.GetSelection(1, 1, 1, 80)[0]
+                                    top_line = code_pane.TopLine
+                                except com_error:
+                                    original_line = 1; top_line = 1
+
+                                # 2. フォーマット処理
+                                original_code = component.CodeModule.Lines(1, component.CodeModule.CountOfLines)
+                                formatted_code = formatter.format_code(original_code)
+                                
+                                if original_code != formatted_code:
+                                    component.CodeModule.DeleteLines(1, component.CodeModule.CountOfLines)
+                                    component.CodeModule.AddFromString(formatted_code)
+
+                                    # 3. 位置情報を復元
+                                    try:
+                                        code_pane.TopLine = top_line
+                                        code_pane.SetSelection(original_line, 1, original_line, 1)
+                                    except com_error:
+                                        pass
+                        
+                        log_queue.put(messages.formatting_complete())
+                        last_status_message = ""
+
+                    current_status_message = messages.monitoring_vbe(os.path.basename(target_filepath))
+                else:
+                    current_status_message = messages.waiting_for_vbe(os.path.basename(target_filepath))
+
+            except com_error: # --- [修正] Exception ではなく com_error を捕捉 ---
+                # VBEとの通信でエラーが発生した場合（Excelが強制終了されたなど）
+                log_queue.put(messages.connection_lost(os.path.basename(target_filepath)))
+                target_app = target_hwnd = target_filepath = None
+                last_status_message = ""
+        else: # 5. 待機処理
+            #print("[DEBUG] No target. Checking window visibility.") # ★追加
+            is_visible = is_any_excel_window_visible()
+            #print(f"[DEBUG] is_any_excel_window_visible: {is_visible}") # ★追加
+            if is_visible: current_status_message = messages.searching_for_book()
+            else: current_status_message = messages.waiting_for_excel()
+
+        # (以下、ループの残りは変更なし)
+        if current_status_message and current_status_message != last_status_message:
+            log_queue.put(current_status_message); last_status_message = current_status_message
+        is_visible_now = is_any_excel_window_visible()
+        #print(f"[DEBUG] Exit Check: was_visible={was_window_visible}, is_now_visible={is_visible_now}")
+        if was_window_visible and not is_visible_now:
+            if ask_to_exit():
+                log_queue.put(messages.exiting_by_dialog()); stop_event.set(); icon.menu.items[0](icon); break
+        was_window_visible = is_visible_now
+        time.sleep(1) # ★デバッグ中は sleep を 2 or 3 に伸ばすと追いやすいです
+
+    #print("[DEBUG] monitoring_loop finished") # ★追加
+    pythoncom.CoUninitialize()
+    log_queue.put(messages.monitoring_stopped())'''
